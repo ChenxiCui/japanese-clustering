@@ -131,7 +131,7 @@ public class JapaneseSentenceClusterer {
 			    	String posTags = token.getPartOfSpeech();
 			    	
 			    	if(posTags.startsWith("名詞")) {  // is there a better way to filter for nouns?
-			    		nouns.append(token.getBaseForm()+" ");
+			    		nouns.append(token.getSurfaceForm()+" ");  // use surface form as base form is null for numbers, katakana, ...
 			    	}
 			    }
 				writer.append(new Text("sentence"+sentenceNum++), new Text(nouns.toString()));
