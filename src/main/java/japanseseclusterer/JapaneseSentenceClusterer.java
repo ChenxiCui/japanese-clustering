@@ -1,9 +1,10 @@
 package japanseseclusterer;
 
 import java.io.BufferedReader;
-import java.io.FileNotFoundException;
-import java.io.FileReader;
 import java.io.IOException;
+import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -23,16 +24,12 @@ import org.apache.mahout.vectorizer.SparseVectorsFromSequenceFiles;
 import org.apache.mahout.math.NamedVector;
 import org.atilika.kuromoji.Token;
 import org.atilika.kuromoji.Tokenizer;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Clusters Japanese sentences according to topics 
  */
 public class JapaneseSentenceClusterer {
-	
-	private static final Logger log = LoggerFactory.getLogger(SparseVectorsFromSequenceFiles.class);
-	
+		
 	private Configuration conf = new Configuration();
 	
 	private FileSystem fs;
@@ -47,7 +44,7 @@ public class JapaneseSentenceClusterer {
 	 * @param inputFile Path to file with one sentence per line
 	 * @param outputDir Path to output directory
 	 */
-	public JapaneseSentenceClusterer(Path inputFile, Path outputDir) {
+	public JapaneseSentenceClusterer(Path inputFile, Path outputDir) throws IOException {
 		
 		this.inputFile = inputFile;
 		this.outputDir = outputDir;		
@@ -57,52 +54,51 @@ public class JapaneseSentenceClusterer {
 			// delete old files
 			fs.delete(outputDir, true);
 		} catch (IOException e) {
-			e.printStackTrace();
+			throw new IOException("File error while creating new Clusterer", e);
 		}
 		
 	}
 	
 	/**
 	 * Starts all steps from input files to clustering
+	 * 
+	 * @return true on successfull run
+	 * @throws Exception 
 	 */
-	public void run() {
-		List<String> sentencesText = readFile();
+	public void run() throws Exception {
+		List<String> sentencesText;
+		
+		sentencesText = readFile();
 		processText(sentencesText);   // Tokenize, filter nouns, sparse vectors (tf-id ...)
 		cluster();
+		
 	}
 	
 	/**
 	 * Reads the input file and stores the lines in an array
 	 */
-	private List<String> readFile() {
+	private List<String> readFile() throws IOException {
 				
 		String line;
 				
-		BufferedReader br;
-		
 		List<String> sentences = new ArrayList<String>();
 		
-		try {
-			br = new BufferedReader(new FileReader(inputFile.toString()));
-						
+		try (BufferedReader br = Files.newBufferedReader(Paths.get(inputFile.toString()), Charset.forName("UTF-8"))) {
 			int lineNumber = 1;
 			while ((line = br.readLine()) != null) {
 				
 				sentences.add(line);
 				lineNumber++;
-				if(lineNumber > 500) {	// TODO: remove after testing
+				if(lineNumber > 3000) {	// TODO: remove after testing
 					break;
 				}
 			}
+
 			br.close();
-	
-		}catch (FileNotFoundException e) {
-			log.error("Could not find input file");
+		} catch (IOException e) {
+			throw new IOException("Error while reading input file "+e.getMessage(), e);
 		}
-		catch(IOException e) {
-			log.error("IOException", e);
-		}
-		
+
 		return sentences;		
 		
 	}
@@ -110,16 +106,13 @@ public class JapaneseSentenceClusterer {
 	/**
 	 * Tokenizes the sentences with Kuromoji and saves them as sequence files.
 	 * Then generates vectors (tf, tfidf), dictionary etc.
+	 * @throws IOException, Exception 
 	 */
-	private void processText(List<String> sentences) {
-		
+	private void processText(List<String> sentences) throws IOException, Exception {
+
 		Tokenizer tokenizer = Tokenizer.builder().build();
-		
-		SequenceFile.Writer writer;
-		
-		try {
-		
-			writer = new SequenceFile.Writer(fs, conf, new Path(outputDir.toString()+"/seqfiles"), Text.class, Text.class);
+			
+		try (SequenceFile.Writer writer = new SequenceFile.Writer(fs, conf, new Path(outputDir.toString()+"/seqfiles"), Text.class, Text.class)) {
 					
 			StringBuilder nouns = new StringBuilder();
 			
@@ -135,10 +128,10 @@ public class JapaneseSentenceClusterer {
 			    	}
 			    }
 				writer.append(new Text("sentence"+sentenceNum++), new Text(nouns.toString()));
-				//writer.append(new Text("Satz"+sentenceNum++), new Text(rawSentence));    // english
+
 			}
 			writer.close();	
-			
+
 			SparseVectorsFromSequenceFiles svf = new SparseVectorsFromSequenceFiles();
 			
 			// -seq -> SequentialAccessSparseVector (best for k-means) | maxDFPercent -> can be used to filter stop words
@@ -147,28 +140,23 @@ public class JapaneseSentenceClusterer {
 			// TODO: add normalization		
 			
 		} catch(IOException e) {
-			log.error("IOException", e);
-		} catch (Exception e) {
-			e.printStackTrace();
-		}
+			throw new IOException("File error while processing text. File: "+e.getMessage(), e);
+		} 
+		
 	}
 	
 	/**
 	 * Does the actual clustering using k-means with an initial random seed
+	 * @throws IOException 
+	 * @throws InterruptedException 
+	 * @throws ClassNotFoundException 
 	 */
-	private void cluster() {
+	private void cluster() throws IOException, ClassNotFoundException, InterruptedException {
 		
-		try {
 			RandomSeedGenerator.buildRandom(conf, new Path(outputDir.toString()+"/vectors/tfidf-vectors"), new Path(outputDir.toString()+"/cluster"), 20, new EuclideanDistanceMeasure());
 		
 			// params: conf, input path, cluster path, output path, convergenceDelta, maxIterations, run clustering, classification threshold, runsequential
-			KMeansDriver.run(conf, new Path(outputDir.toString()+"/vectors/tfidf-vectors"), new Path(outputDir.toString()+"/cluster"), new Path(outputDir.toString()+"/result"), 0.001, 10, true, 0.0, false);
-			
-		} catch (IOException e) {
-			log.error("IOException", e);
-		} catch (Exception e) {
-			e.printStackTrace();
-		}
+			KMeansDriver.run(conf, new Path(outputDir.toString()+"/vectors/tfidf-vectors"), new Path(outputDir.toString()+"/cluster"), new Path(outputDir.toString()+"/result"), 0.001, 10, true, 0.5, false);
 	
 	}
 	
@@ -177,12 +165,10 @@ public class JapaneseSentenceClusterer {
 	 * (Alternatively use Mahout's clusterdumper tool, which shows the top terms per cluster etc.)
 	 * 
 	 */
-	private void printResults() {
-		SequenceFile.Reader reader;
-		try {
-			reader = new SequenceFile.Reader(fs, new Path(outputDir.toString()+"/result/clusteredPoints/part-m-00000"), conf);
+	private void printResults() throws IOException {
 		
-			
+		try (SequenceFile.Reader reader = new SequenceFile.Reader(fs, new Path(outputDir.toString()+"/result/clusteredPoints/part-m-00000"), conf)) {
+		
 			IntWritable key = new IntWritable();
 			WeightedPropertyVectorWritable value = new WeightedPropertyVectorWritable();
 			
@@ -215,18 +201,24 @@ public class JapaneseSentenceClusterer {
 			}
 			
 		} catch (IOException e) {
-			e.printStackTrace();
+			throw new IOException("File error while reading result. File: " + e.getMessage(), e);
 		}
 		
 	}
 	
 	public static void main(String[] args) {
 				
-		JapaneseSentenceClusterer clusterer = new JapaneseSentenceClusterer(new Path("data/input/examples.utf"), new Path("data/output"));
-		
-		clusterer.run();
-		
-		clusterer.printResults();
+		try {
+			JapaneseSentenceClusterer clusterer = new JapaneseSentenceClusterer(new Path("data/input/examples.utf"), new Path("data/output"));
+					
+			clusterer.run();
+	
+			// check result
+			clusterer.printResults();
+			
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
 		
 	}
 
