@@ -10,17 +10,29 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 
+import org.apache.mahout.common.Pair;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.io.SequenceFile;
 import org.apache.hadoop.io.Text;
+import org.apache.mahout.utils.clustering.ClusterDumper;
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.ja.JapaneseAnalyzer;
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.lucene.util.Version;
+import org.apache.mahout.clustering.Cluster;
+import org.apache.mahout.clustering.canopy.CanopyDriver;
 import org.apache.mahout.clustering.classify.WeightedPropertyVectorWritable;
+import org.apache.mahout.clustering.classify.WeightedVectorWritable;
 import org.apache.mahout.clustering.kmeans.KMeansDriver;
 import org.apache.mahout.clustering.kmeans.RandomSeedGenerator;
 import org.apache.mahout.common.distance.EuclideanDistanceMeasure;
+import org.apache.mahout.vectorizer.DictionaryVectorizer;
+import org.apache.mahout.vectorizer.DocumentProcessor;
 import org.apache.mahout.vectorizer.SparseVectorsFromSequenceFiles;
+import org.apache.mahout.vectorizer.tfidf.TFIDFConverter;
 import org.apache.mahout.math.NamedVector;
 import org.atilika.kuromoji.Token;
 import org.atilika.kuromoji.Tokenizer;
@@ -38,6 +50,16 @@ public class JapaneseSentenceClusterer {
 	
 	private Path outputDir;
 	
+	private Path seqFilesDir;
+	
+	private Path clustersDir;
+	
+	private Path vectorsDir;
+	
+	private Path tfidfVectorsDir;
+	
+	private Path resultsDir;
+	
 	/** 
 	 * Constructor - initializes FileSystem and clears the output folder
 	 * 
@@ -47,7 +69,13 @@ public class JapaneseSentenceClusterer {
 	public JapaneseSentenceClusterer(Path inputFile, Path outputDir) throws IOException {
 		
 		this.inputFile = inputFile;
-		this.outputDir = outputDir;		
+		this.outputDir = outputDir;
+		
+		this.seqFilesDir = new Path(outputDir, "seqfiles");
+		this.clustersDir = new Path(outputDir, "clusters"); 
+		this.vectorsDir = new Path(outputDir, "vectors"); 
+		this.tfidfVectorsDir = new Path(outputDir, "tfidf-vectors");
+		this.resultsDir = new Path(outputDir, "results");
 		
 		try {
 			this.fs = FileSystem.get(conf);
@@ -89,7 +117,7 @@ public class JapaneseSentenceClusterer {
 				
 				sentences.add(line);
 				lineNumber++;
-				if(lineNumber > 3000) {	// TODO: remove after testing
+				if(lineNumber > 100000) {	// TODO: remove after testing
 					break;
 				}
 			}
@@ -109,35 +137,42 @@ public class JapaneseSentenceClusterer {
 	 * @throws IOException, Exception 
 	 */
 	private void processText(List<String> sentences) throws IOException, Exception {
-
-		Tokenizer tokenizer = Tokenizer.builder().build();
-			
-		try (SequenceFile.Writer writer = new SequenceFile.Writer(fs, conf, new Path(outputDir.toString()+"/seqfiles"), Text.class, Text.class)) {
+		
+		try (SequenceFile.Writer writer = new SequenceFile.Writer(fs, conf, seqFilesDir, Text.class, Text.class)) {
 					
-			StringBuilder nouns = new StringBuilder();
-			
 			int sentenceNum = 0;
 			
+			// write raw text to sequencefiles
 			for (String rawSentence : sentences) {
-				
-				for (Token token : tokenizer.tokenize(rawSentence)) {
-			    	String posTags = token.getPartOfSpeech();
-			    	
-			    	if(posTags.startsWith("名詞")) {  // is there a better way to filter for nouns?
-			    		nouns.append(token.getSurfaceForm()+" ");  // use surface form as base form is null for numbers, katakana, ...
-			    	}
-			    }
-				writer.append(new Text("sentence"+sentenceNum++), new Text(nouns.toString()));
-
+				writer.append(new Text("sentence"+sentenceNum++), new Text(rawSentence));
 			}
 			writer.close();	
-
-			SparseVectorsFromSequenceFiles svf = new SparseVectorsFromSequenceFiles();
 			
-			// -seq -> SequentialAccessSparseVector (best for k-means) | maxDFPercent -> can be used to filter stop words
-			svf.run(new String[]{"-i", outputDir.toString()+"/seqfiles", "-o", outputDir.toString()+"/vectors", "-seq", "--maxDFPercent", "85", "--namedVector"});
+			JapaneseAnalyzer analyzer = new JapaneseAnalyzer(Version.LUCENE_47);
 			
-			// TODO: add normalization		
+			Path tokenizedDocsPath = new Path(outputDir, DocumentProcessor.TOKENIZED_DOCUMENT_OUTPUT_FOLDER);
+			
+			DocumentProcessor.tokenizeDocuments(seqFilesDir, analyzer.getClass().asSubclass(Analyzer.class), tokenizedDocsPath, conf);
+			
+			int minSupport = 2;
+			int minDf = 5;
+			int maxDFPercent = 95;
+			int maxNGramSize = 2;
+			int minLLRValue = 50;
+			int reduceTasks = 1;
+			int chunkSize = 200;
+			int norm = 2;
+			boolean sequentialAccessOutput = true;
+			boolean logNormalize = true;
+			
+			DictionaryVectorizer.createTermFrequencyVectors(tokenizedDocsPath, outputDir, DictionaryVectorizer.DOCUMENT_VECTOR_OUTPUT_FOLDER, conf, minSupport, maxNGramSize, minLLRValue, 
+					2, true, reduceTasks, chunkSize, sequentialAccessOutput, true);
+						
+			Pair<Long[], List<Path>> features = TFIDFConverter.calculateDF(new Path(outputDir.toString(), DictionaryVectorizer.DOCUMENT_VECTOR_OUTPUT_FOLDER), outputDir, conf, chunkSize);
+			
+			TFIDFConverter.processTfIdf(new Path(outputDir.toString(), DictionaryVectorizer.DOCUMENT_VECTOR_OUTPUT_FOLDER), outputDir, conf, features, minDf, maxDFPercent, norm, logNormalize, sequentialAccessOutput, true, reduceTasks);
+			
+			// TODO: add normalization ?		
 			
 		} catch(IOException e) {
 			throw new IOException("File error while processing text. File: "+e.getMessage(), e);
@@ -151,12 +186,17 @@ public class JapaneseSentenceClusterer {
 	 * @throws InterruptedException 
 	 * @throws ClassNotFoundException 
 	 */
-	private void cluster() throws IOException, ClassNotFoundException, InterruptedException {
+	private void cluster() throws IOException, ClassNotFoundException, InterruptedException {	
 		
-			RandomSeedGenerator.buildRandom(conf, new Path(outputDir.toString()+"/vectors/tfidf-vectors"), new Path(outputDir.toString()+"/cluster"), 20, new EuclideanDistanceMeasure());
-		
+			RandomSeedGenerator.buildRandom(conf, tfidfVectorsDir, clustersDir, 10, new EuclideanDistanceMeasure());
+			
+			/* better use canopy clustering for cluster initialization?
+ 			Path canopyCentroids = new Path(outputDir, "canopy-centroids");
+			CanopyDriver.run(conf, tfidfVectorsDir, canopyCentroids, new EuclideanDistanceMeasure(), 250, 120, true, 0.5, false);
+			 */
+			
 			// params: conf, input path, cluster path, output path, convergenceDelta, maxIterations, run clustering, classification threshold, runsequential
-			KMeansDriver.run(conf, new Path(outputDir.toString()+"/vectors/tfidf-vectors"), new Path(outputDir.toString()+"/cluster"), new Path(outputDir.toString()+"/result"), 0.001, 10, true, 0.5, false);
+			KMeansDriver.run(conf, tfidfVectorsDir, clustersDir, resultsDir, 0.001, 10, true, 0.5, true);  // change last true to false for hadoop
 	
 	}
 	
@@ -167,8 +207,22 @@ public class JapaneseSentenceClusterer {
 	 */
 	private void printResults() throws IOException {
 		
-		try (SequenceFile.Reader reader = new SequenceFile.Reader(fs, new Path(outputDir.toString()+"/result/clusteredPoints/part-m-00000"), conf)) {
+		ClusterDumper dumper = new ClusterDumper(seqFilesDir, new Path(resultsDir + "/" + Cluster.CLUSTERED_POINTS_DIR + "/part-m-0"));
 		
+		// TODO: set the clusters-*-final path automatically. Right now the clusterdumper does not output anything if the no of iterations does not match the value here
+		String[] params = {"-dt", "sequencefile", "-d", "data/output/dictionary.file-*", "-i", "data/output/results/clusters-2-final/", "-p", "data/output/results/clusteredPoints"};
+		
+		try {
+			System.out.println("Running clusterdumper: ");
+			dumper.run(params);
+		} catch (Exception e1) {
+			System.err.println("Error while running clusterdumper");
+			e1.printStackTrace();
+		}
+		
+		/* TODO: fix Reader
+		try {
+			SequenceFile.Reader reader = new SequenceFile.Reader(fs, new Path(resultsDir + "/" + Cluster.CLUSTERED_POINTS_DIR + "/part-m-0"), conf);
 			IntWritable key = new IntWritable();
 			WeightedPropertyVectorWritable value = new WeightedPropertyVectorWritable();
 			
@@ -176,6 +230,7 @@ public class JapaneseSentenceClusterer {
 			HashMap<Integer, List<String>> cluster = new HashMap<Integer, List<String>>();
 			
 			while (reader.next(key, value)) {
+
 				NamedVector vec = (NamedVector) value.getVector();
 				
 				// create entry for cluster, if it does not exist yet
@@ -203,7 +258,7 @@ public class JapaneseSentenceClusterer {
 		} catch (IOException e) {
 			throw new IOException("File error while reading result. File: " + e.getMessage(), e);
 		}
-		
+		*/
 	}
 	
 	public static void main(String[] args) {
